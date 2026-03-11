@@ -6,6 +6,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from sandbox.runtime import ExecutionResult, run_in_sandbox
+from engines.profiler import ComplexityResult, run_profiler
 
 
 app = FastAPI(title="Detonation Chamber Backend", version="0.1.0")
@@ -30,7 +31,7 @@ class SecurityReport(BaseModel):
 class AnalysisReport(BaseModel):
     meta: AnalysisMeta
     security: Optional[SecurityReport] = None
-    complexity: Optional[Dict] = None
+    complexity: Optional[List[Dict]] = None
     taint: Optional[Dict] = None
 
 
@@ -59,6 +60,26 @@ async def analyze(request: AnalyzeRequest) -> AnalysisReport:
             ]
         )
 
+    complexity: Optional[List[Dict]] = None
+    if "complexity" in request.engines:
+        profiler_results: List[ComplexityResult] = run_profiler(request.code)
+        complexity = [
+            {
+                "function_name": r.function_name,
+                "complexity_class": r.complexity_class,
+                "confidence": r.confidence,
+                "matrix": {
+                    n: {
+                        "n": p.n,
+                        "time_ms": p.time_ms,
+                        "peak_kb": p.peak_kb,
+                    }
+                    for n, p in r.matrix.items()
+                },
+            }
+            for r in profiler_results
+        ] or None
+
     report = AnalysisReport(
         meta=AnalysisMeta(
             engines=request.engines,
@@ -66,7 +87,7 @@ async def analyze(request: AnalyzeRequest) -> AnalysisReport:
             duration_ms=result.duration_ms,
         ),
         security=security,
-        complexity=None,
+        complexity=complexity,
         taint=None,
     )
     return report
@@ -105,6 +126,18 @@ async def analyze_ws(websocket: WebSocket) -> None:
                 ]
             }
 
+        complexity: Optional[List[Dict]] = None
+        if "complexity" in request.engines:
+            profiler_results = run_profiler(request.code)
+            complexity = [
+                {
+                    "function_name": r.function_name,
+                    "complexity_class": r.complexity_class,
+                    "confidence": r.confidence,
+                }
+                for r in profiler_results
+            ] or None
+
         await websocket.send_json(
             {
                 "type": "complete",
@@ -115,7 +148,7 @@ async def analyze_ws(websocket: WebSocket) -> None:
                         "duration_ms": result.duration_ms,
                     },
                     "security": security,
-                    "complexity": None,
+                    "complexity": complexity,
                     "taint": None,
                 },
             }

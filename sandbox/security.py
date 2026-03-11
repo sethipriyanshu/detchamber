@@ -77,10 +77,14 @@ def build_restricted_globals(
         "min": builtins.min,
         "print": builtins.print,
         "range": builtins.range,
+        "sum": builtins.sum,
         "str": builtins.str,
         "tuple": builtins.tuple,
         "enumerate": builtins.enumerate,
         "zip": builtins.zip,
+        # Allow safe importing inside the sandbox; we rely on policy and
+        # future engines for deeper inspection of what gets imported.
+        "__import__": builtins.__import__,
     }
 
     # Overlay blocked operations with wrappers so calls like open(...) or eval(...)

@@ -18,3 +18,18 @@ def test_analyze_security_engine_blocks_open() -> None:
     assert res.status_code == 200
     body = res.json()
     assert body["security"]["violations"]
+
+
+def test_analyze_complexity_engine_returns_results() -> None:
+    code = """
+def linear(items):
+    total = 0
+    for x in items:
+        total += x
+    return total
+"""
+    res = client.post("/analyze", json={"code": code, "engines": ["complexity"]})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["complexity"] is not None
+    assert isinstance(body["complexity"], list)
