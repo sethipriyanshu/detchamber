@@ -33,3 +33,19 @@ def linear(items):
     body = res.json()
     assert body["complexity"] is not None
     assert isinstance(body["complexity"], list)
+
+
+def test_analyze_taint_engine_returns_findings() -> None:
+    code = """
+import os
+
+def main():
+    user = input("name? ")
+    cmd = user
+    os.system(cmd)
+"""
+    res = client.post("/analyze", json={"code": code, "engines": ["taint"]})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["taint"] is not None
+    assert body["taint"]["findings"]

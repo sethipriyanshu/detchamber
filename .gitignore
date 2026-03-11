@@ -2,3 +2,9 @@
 ~$*.docx
 specifications.txt
 development-plan.txt
+node_modules
+dist
+__pycache__
+.pytest_cache
+.venv
+.env

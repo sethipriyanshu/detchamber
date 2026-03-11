@@ -3,13 +3,25 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from sandbox.runtime import ExecutionResult, run_in_sandbox
 from engines.profiler import ComplexityResult, run_profiler
+from engines.taint import TaintReport, run_taint
+from .ai_summary import router as ai_router
 
 
 app = FastAPI(title="Detonation Chamber Backend", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:3000", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(ai_router)
 
 
 class AnalyzeRequest(BaseModel):
@@ -28,11 +40,22 @@ class SecurityReport(BaseModel):
     violations: List[Dict]
 
 
+class TaintFindingModel(BaseModel):
+    source_var: str
+    sink_func: str
+    source_line: int
+    sink_line: int
+
+
+class TaintReportModel(BaseModel):
+    findings: List[TaintFindingModel]
+
+
 class AnalysisReport(BaseModel):
     meta: AnalysisMeta
     security: Optional[SecurityReport] = None
     complexity: Optional[List[Dict]] = None
-    taint: Optional[Dict] = None
+    taint: Optional[TaintReportModel] = None
 
 
 @app.get("/health")
@@ -80,6 +103,22 @@ async def analyze(request: AnalyzeRequest) -> AnalysisReport:
             for r in profiler_results
         ] or None
 
+    taint_report: Optional[TaintReportModel] = None
+    if "taint" in request.engines:
+        tr: TaintReport = run_taint(request.code)
+        if tr.findings:
+            taint_report = TaintReportModel(
+                findings=[
+                    TaintFindingModel(
+                        source_var=f.source_var,
+                        sink_func=f.sink_func,
+                        source_line=f.source_line,
+                        sink_line=f.sink_line,
+                    )
+                    for f in tr.findings
+                ]
+            )
+
     report = AnalysisReport(
         meta=AnalysisMeta(
             engines=request.engines,
@@ -88,7 +127,7 @@ async def analyze(request: AnalyzeRequest) -> AnalysisReport:
         ),
         security=security,
         complexity=complexity,
-        taint=None,
+        taint=taint_report,
     )
     return report
 
@@ -138,6 +177,22 @@ async def analyze_ws(websocket: WebSocket) -> None:
                 for r in profiler_results
             ] or None
 
+        taint_payload: Optional[Dict] = None
+        if "taint" in request.engines:
+            tr = run_taint(request.code)
+            if tr.findings:
+                taint_payload = {
+                    "findings": [
+                        {
+                            "source_var": f.source_var,
+                            "sink_func": f.sink_func,
+                            "source_line": f.source_line,
+                            "sink_line": f.sink_line,
+                        }
+                        for f in tr.findings
+                    ]
+                }
+
         await websocket.send_json(
             {
                 "type": "complete",
@@ -149,7 +204,7 @@ async def analyze_ws(websocket: WebSocket) -> None:
                     },
                     "security": security,
                     "complexity": complexity,
-                    "taint": None,
+                    "taint": taint_payload,
                 },
             }
         )
