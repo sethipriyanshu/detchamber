@@ -1,0 +1,259 @@
+PHASED DEVELOPMENT PLAN — DETONATION CHAMBER
+
+Phase 1 — Sandbox Runtime & Orchestrator (Backend Core)
+
+1.1 Project bootstrap & repo layout
+- Initialize a new git repo and basic Python project (pyproject.toml or requirements.txt).
+- Create initial structure:
+  - backend/ (FastAPI app, orchestration, models)
+  - engines/security/, engines/profiler/, engines/taint/
+  - sandbox/ (isolated execution runtime)
+  - tests/
+- Add base dependencies: fastapi, uvicorn, pydantic, pytest, httpx, RestrictedPython (or equivalent), tracemalloc (stdlib), etc.
+- Wire a simple backend/main.py with GET /health returning {status: "ok"}.
+
+1.2 Subprocess isolation runtime
+- Implement sandbox/runtime.py with a function like run_in_sandbox(code: str, timeout: int, mem_limit_mb: int) -> ExecutionResult.
+- Use multiprocessing.Process or subprocess to fork a child process that:
+  - Receives the code string via pipe or temp file.
+  - Sets up a restricted global namespace (limited __builtins__).
+  - Executes the code via exec() inside try/except, capturing stdout, stderr, and exit_code.
+- Implement timeout handling: parent kills child if exceeding configurable timeout.
+- Implement memory limit (Linux-first): use resource.setrlimit or similar; enforce a default (e.g., 256MB).
+- Define and implement ExecutionResult (e.g., Pydantic model) with fields: stdout, stderr, exit_code, duration_ms, violations: list[ThreatLogEntry].
+- Add minimal tests:
+  - Code that prints output.
+  - Code that loops forever (verify timeout).
+  - Code that allocates large memory (verify memory ceiling).
+
+1.3 Security interceptor with sys.settrace
+- In the sandbox child process, install a sys.settrace-based tracer:
+  - On call events, inspect function/module; detect calls to restricted APIs.
+  - Maintain a ThreatLog list capturing: line_no, filename, func_name, op_type, severity, args_repr.
+- Replace dangerous builtins and modules in the sandbox namespace:
+  - Wrap or block open, socket, subprocess, os.system, eval, exec, __import__, etc.
+  - Ensure proxies raise custom SecurityViolation exceptions that are captured and logged but don’t crash the tracer.
+- Implement deny/allow policy definitions in a config or constants module:
+  - Map operation → severity (MEDIUM/HIGH/CRITICAL).
+- Ensure user code cannot unset the tracer:
+  - Guard against sys.settrace(None) from user code by validating who is calling.
+- Extend ExecutionResult to include threat_log: list[ThreatEntry].
+- Tests:
+  - Script that calls open() → violation logged, severity HIGH.
+  - Script that uses subprocess.run() → violation CRITICAL.
+  - Benign script (just math/print) → no violations.
+
+1.4 Seccomp (Linux) integration
+- Add a Linux-only layer in the child process that:
+  - Installs a seccomp BPF filter to block high-risk syscalls (execve, socket, unsafe open modes, etc.).
+- Design it to be optional / no-op on macOS/Windows (guard by OS checks).
+- Provide a config flag ENABLE_SECCOMP so development on macOS doesn’t break.
+- Test on Linux: script that tries to spawn a process or open a socket → killed or blocked with logged violation.
+
+1.5 FastAPI orchestrator (HTTP + WebSocket)
+- Define request/response models:
+  - AnalyzeRequest { code: str, engines: list[str], timeout_ms: Optional[int] }
+  - AnalysisReport { security?, complexity?, taint?, execution_meta }
+  - WebSocket event models: {engine, type, payload, severity?, timestamp}.
+- Implement POST /analyze:
+  - Validate input (non-empty code, allowed engine names).
+  - For each enabled engine, spin off async tasks that:
+    - Call into sandbox/execution + specific engine logic.
+  - Aggregate into AnalysisReport and return JSON.
+- Implement WebSocket /ws/analyze:
+  - Accept same request payload as first message or query params.
+  - Stream incremental events per engine: status updates, violations, profiler samples, taint findings.
+  - Send a final “complete” event with the full AnalysisReport.
+- Keep GET /health.
+- Tests:
+  - Unit tests for orchestrator functions (mock engines).
+  - Integration tests using httpx.AsyncClient visiting /health and /analyze.
+
+
+Phase 2 — Complexity Profiler Engine
+
+2.1 Function detection (AST scanner)
+- Implement engines/profiler/detector.py:
+  - Parse code using ast.parse.
+  - Collect top-level ast.FunctionDef nodes.
+  - For each, create a ProfileTarget with name, param_names, param_count, inferred input_kind.
+- Basic type inference:
+  - Use parameter name heuristics (items, arr, data → list; text, s → string; etc.).
+  - Use type annotations, if present (List[int], str, etc.).
+- Tests:
+  - Various sample scripts with different function shapes; assert correct detection and inference.
+
+2.2 Synthetic input generator
+- Implement engines/profiler/input_gen.py:
+  - Generate deterministic synthetic inputs for each ProfileTarget at n = [10, 50, 100, 500, 1000, 5000].
+  - Seed random module for reproducibility.
+  - Support multiple input kinds: list of ints, string, dict with n keys, numeric scalar, etc.
+- Add configuration to tweak n values.
+- Tests:
+  - Re-run generator multiple times; ensure results are identical.
+  - Verify shapes/sizes of generated inputs per type.
+
+2.3 Measurement harness
+- Implement engines/profiler/harness.py:
+  - For each (function, n), execute inside sandbox:
+    - Enable tracemalloc around the call.
+    - Measure wall time using multiple repetitions (e.g., min over 3 runs).
+    - Count instructions via sys.setprofile or another trace-based counter.
+  - Build a MeasurementMatrix mapping n → (time_ms, peak_kb, instruction_count).
+- Decide where the function is looked up (execute user code once to define functions, then call them).
+- Handle timeouts or errors gracefully and mark sample points as failed.
+- Tests:
+  - Simple O(n) loop function → increasing time pattern.
+  - Constant-time function → near-flat times.
+
+2.4 Complexity classifier
+- Implement engines/profiler/classifier.py:
+  - Define candidate complexity models: constant, log, linear, n log n, n², n³, 2ⁿ.
+  - Use scipy.optimize.curve_fit or custom regression to fit observed time_ms vs n.
+  - Choose best fit via residual sum of squares; compute normalized confidence.
+  - Return ComplexityResult { function_name, complexity_class, confidence, matrix }.
+- Integrate with orchestrator:
+  - Profiler engine returns list of ComplexityResult per function.
+- Tests:
+  - Known O(n²) function (nested loops) should be classified as O(n²) with high confidence.
+  - Constant function classified as O(1).
+
+
+Phase 3 — Taint Tracker Engine
+
+3.1 AST parser & source/sink registries
+- Implement engines/taint/parser.py:
+  - Parse code into AST.
+  - Collect necessary metadata (line numbers, function scopes).
+- Implement configuration-backed SourceRegistry and SinkRegistry:
+  - Default sources: function params, input(), sys.argv, os.environ[…], request.*.
+  - Default sinks: eval, exec, os.system, subprocess.run, DB cursor.execute, f-strings/.format() building queries or shell commands.
+- Allow extension via YAML/JSON config without code changes.
+- Tests:
+  - Registry loads defaults and merges overrides from config.
+
+3.2 Control Flow Graph (CFG) builder
+- Implement engines/taint/cfg.py:
+  - Walk AST to build a simplified CFG:
+    - Nodes: statements (assign, call, return, if, loop).
+    - Edges: flow between nodes (linear, then branch and merge).
+  - Attach source line numbers and variable reads/writes to nodes.
+- Represent CFG as adjacency lists; keep it minimal for v1.
+- Tests:
+  - Small scripts with if/else and loops; assert approximate CFG shape and node metadata.
+
+3.3 Taint propagation and finding generation
+- Implement engines/taint/engine.py:
+  - Maintain TaintState: dict[var_name, bool].
+  - Traverse CFG in reasonable order (e.g., forward dataflow, iterative to fixed-point if needed).
+  - When encountering sources, taint variables.
+  - Propagate taint through expressions and assignments.
+  - When encountering sinks, check arguments:
+    - If any tainted → record TaintFinding { source_var, sink_func, source_line, sink_line, path }.
+  - Support basic sanitizers (configurable): e.g., HTML escapes, parameterized SQL.
+- Build TaintReport { findings: list[TaintFinding], final_state }.
+- Tests:
+  - Simple injection cases (input → string concat → os.system) produce findings.
+  - Properly sanitized flow (input → sanitizer → sink) is not flagged.
+
+
+Phase 4 — Frontend & UI (React + Monaco)
+
+4.1 Frontend skeleton and API client
+- Initialize frontend/ with React (Vite or CRA) and TypeScript.
+- Setup layout: top toolbar, left editor panel, right console/report panel.
+- Implement a small API client:
+  - POST /analyze wrapper.
+  - WebSocket client for /ws/analyze with event handling.
+- Add environment/config handling for backend base URL.
+
+4.2 Code editor panel (Monaco)
+- Integrate Monaco Editor with Python syntax highlighting.
+- Manage editor state (code string).
+- Add engine toggles (Security, Complexity, Taint) and the red DETONATE button.
+- After analysis, support read-only mode and line decorations based on backend-provided annotations.
+- Tests (if using React Testing Library):
+  - Editor renders, accepts text, and triggers detonate callback.
+
+4.3 Language detection module
+- Implement languageDetection.ts:
+  - Regex-based heuristics for Python, JS, Java, TS, Go, Rust, C/C++, SQL.
+  - Return { language, confidence, matches }.
+- Wire it to editor input with ~300ms debounce.
+- Display a badge under the editor:
+  - Green “Python detected” when appropriate.
+  - Warning for non-Python languages; disable DETONATE.
+  - Info for unknown/ambiguous.
+- Tests:
+  - Strings for each language; verify detection results and confidence ranges.
+
+4.4 Execution console (WebSocket streaming)
+- Implement console view:
+  - Connect on DETONATE click; send code + engine selection.
+  - Stream and render events as log lines, color-coded by engine/severity.
+  - Maintain per-engine progress (spinner → checkmark/X).
+  - Auto-scroll with “pause autoscroll” when user scrolls up.
+- Handle WebSocket errors and timeouts gracefully.
+- Tests:
+  - Mock WebSocket events; assert rendering and color-coding.
+
+4.5 Report dashboard
+- Implement a tabbed report view:
+  - Summary tab with PASS/WARN/FAIL, counts by severity, total runtime.
+  - Security tab: Monaco with inline markers and side threat table.
+  - Complexity tab: scaling chart (Recharts/D3) using MeasurementMatrix, complexity labels.
+  - Taint tab: code view annotations plus a table of taint findings.
+- Add Export button for JSON (and later PDF if desired).
+- Tests:
+  - Render report from a mock AnalysisReport; verify key fields.
+
+
+Phase 5 — Infrastructure, Testing, and DX
+
+5.1 Project structure & tooling
+- Finalize tree:
+  - frontend/, backend/, engines/, sandbox/, tests/, config/.
+- Add docker-compose.yml:
+  - One service for backend (FastAPI + Uvicorn).
+  - One service for frontend (React dev server or built static served via simple server).
+- Add Makefile targets:
+  - make dev: run docker-compose or parallel local dev servers.
+  - make test: run backend and engine tests.
+  - make lint: run flake8/ruff and eslint/tsc.
+- Ensure .gitignore is complete for Python, Node, build artifacts, and your spec files.
+
+5.2 Testing strategy and fixtures
+- Build tests/fixtures/ with small Python scripts:
+  - Script that reads a file (Security).
+  - Script that performs nested loops O(n²) (Profiler).
+  - Script that passes user input into eval() or cursor.execute (Taint).
+- Pytest suites:
+  - Unit tests for each engine module.
+  - Integration tests hitting /analyze and checking AnalysisReport.
+- Frontend tests:
+  - Language detection unit tests.
+  - Component tests for editor, console, and dashboard.
+
+5.3 Configuration & documentation
+- Implement config files:
+  - Backend config (YAML/JSON) with timeout, memory ceiling, profiler n values, taint source/sink registries.
+  - Frontend config (e.g., config.ts or .env) with backend URLs.
+- Write a concise README.md:
+  - High-level pitch (what Detonation Chamber is).
+  - Architecture overview.
+  - Quickstart: make dev, make test.
+  - Example usage (pasting a vulnerable script and reading the report).
+- Optionally add a short “Portfolio Notes” section summarizing the CS fundamentals it demonstrates.
+
+
+Phase 6 — Polish, UX, and Future-Ready Hooks
+
+6.1 UX polish
+- Improve visual design (colors, spacing, typography) for the three engine colors (red/amber/blue).
+- Add helpful empty states and tooltips.
+- Provide inline links or tooltips explaining findings and recommended fixes.
+
+6.2 Extensibility hooks (language adapters)
+- Formalize a LanguageAdapter interface in code to match the spec.
+- Implement the Python adapter as v1, but structure it so additional adapters (e.g., JS) can be registered later.
+- Ensure orchestrator and frontend treat language as a parameter, not a special case.
