@@ -195,6 +195,7 @@ export function App() {
             <th>Operation</th>
             <th>Line</th>
             <th>Function</th>
+            <th>Origin</th>
             <th>Message</th>
           </tr>
         </thead>
@@ -205,6 +206,7 @@ export function App() {
               <td>{v.operation}</td>
               <td>{v.lineno ?? "-"}</td>
               <td>{v.func_name ?? "-"}</td>
+              <td>{v.origin ?? "runtime"}</td>
               <td>{v.message}</td>
             </tr>
           ))}
@@ -242,6 +244,7 @@ export function App() {
             <th>Function</th>
             <th>Class</th>
             <th>Confidence</th>
+            <th>Source</th>
           </tr>
         </thead>
         <tbody>
@@ -250,6 +253,7 @@ export function App() {
               <td>{c.function_name}</td>
               <td>{c.complexity_class}</td>
               <td>{(c.confidence * 100).toFixed(1)}%</td>
+              <td>{c.source ?? "measured"}</td>
             </tr>
           ))}
         </tbody>

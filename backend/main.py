@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from sandbox.runtime import ExecutionResult, run_in_sandbox
 from engines.profiler import ComplexityResult, run_profiler
+from engines.security_static import static_security_scan
 from engines.taint import TaintReport, run_taint
 from .ai_summary import router as ai_router
 
@@ -70,18 +71,30 @@ async def analyze(request: AnalyzeRequest) -> AnalysisReport:
 
     security = None
     if "security" in request.engines:
-        security = SecurityReport(
-            violations=[
-                {
-                    "severity": v.severity,
-                    "operation": v.operation,
-                    "message": v.message,
-                    "lineno": v.lineno,
-                    "func_name": v.func_name,
-                }
-                for v in result.violations
-            ]
-        )
+        runtime_violations = [
+            {
+                "severity": v.severity,
+                "operation": v.operation,
+                "message": v.message,
+                "lineno": v.lineno,
+                "func_name": v.func_name,
+                "origin": "runtime",
+            }
+            for v in result.violations
+        ]
+        static_threats = static_security_scan(request.code)
+        static_violations = [
+            {
+                "severity": t.severity,
+                "operation": t.operation,
+                "message": t.message,
+                "lineno": t.lineno,
+                "func_name": None,
+                "origin": "static",
+            }
+            for t in static_threats
+        ]
+        security = SecurityReport(violations=runtime_violations + static_violations)
 
     complexity: Optional[List[Dict]] = None
     if "complexity" in request.engines:
@@ -91,6 +104,7 @@ async def analyze(request: AnalyzeRequest) -> AnalysisReport:
                 "function_name": r.function_name,
                 "complexity_class": r.complexity_class,
                 "confidence": r.confidence,
+                "source": "measured" if r.matrix else "static",
                 "matrix": {
                     n: {
                         "n": p.n,
@@ -148,50 +162,115 @@ async def analyze_ws(websocket: WebSocket) -> None:
                 "engines": request.engines,
             }
         )
-        result: ExecutionResult = run_in_sandbox(request.code, timeout_s=timeout_s)
 
-        security = None
-        if "security" in request.engines:
-            security = {
-                "violations": [
-                    {
-                        "severity": v.severity,
-                        "operation": v.operation,
-                        "message": v.message,
-                        "lineno": v.lineno,
-                        "func_name": v.func_name,
-                    }
-                    for v in result.violations
-                ]
-            }
-
+        # We evaluate engines sequentially so that each one has a chance to run
+        # and report, even if another times out or fails.
+        security: Optional[Dict] = None
         complexity: Optional[List[Dict]] = None
-        if "complexity" in request.engines:
-            profiler_results = run_profiler(request.code)
-            complexity = [
-                {
-                    "function_name": r.function_name,
-                    "complexity_class": r.complexity_class,
-                    "confidence": r.confidence,
-                }
-                for r in profiler_results
-            ] or None
-
         taint_payload: Optional[Dict] = None
-        if "taint" in request.engines:
-            tr = run_taint(request.code)
-            if tr.findings:
-                taint_payload = {
-                    "findings": [
+
+        overall_timed_out = False
+        total_duration_ms = 0.0
+
+        if "security" in request.engines:
+            await websocket.send_json(
+                {
+                    "type": "status",
+                    "engine": "security",
+                    "message": "start",
+                    "engines": request.engines,
+                }
+            )
+            try:
+                sec_result: ExecutionResult = run_in_sandbox(
+                    request.code, timeout_s=timeout_s
+                )
+                overall_timed_out = overall_timed_out or sec_result.timed_out
+                total_duration_ms += sec_result.duration_ms
+                security = {
+                    "violations": [
                         {
-                            "source_var": f.source_var,
-                            "sink_func": f.sink_func,
-                            "source_line": f.source_line,
-                            "sink_line": f.sink_line,
+                            "severity": v.severity,
+                            "operation": v.operation,
+                            "message": v.message,
+                            "lineno": v.lineno,
+                            "func_name": v.func_name,
                         }
-                        for f in tr.findings
+                        for v in sec_result.violations
                     ]
                 }
+            finally:
+                await websocket.send_json(
+                    {
+                        "type": "status",
+                        "engine": "security",
+                        "message": "completed",
+                        "engines": request.engines,
+                    }
+                )
+
+        if "complexity" in request.engines:
+            await websocket.send_json(
+                {
+                    "type": "status",
+                    "engine": "complexity",
+                    "message": "start",
+                    "engines": request.engines,
+                }
+            )
+            try:
+                profiler_results = run_profiler(request.code)
+                complexity = [
+                    {
+                        "function_name": r.function_name,
+                        "complexity_class": r.complexity_class,
+                        "confidence": r.confidence,
+                        "source": "measured" if r.matrix else "static",
+                    }
+                    for r in profiler_results
+                ] or None
+            finally:
+                await websocket.send_json(
+                    {
+                        "type": "status",
+                        "engine": "complexity",
+                        "message": "completed",
+                        "engines": request.engines,
+                    }
+                )
+
+        if "taint" in request.engines:
+            await websocket.send_json(
+                {
+                    "type": "status",
+                    "engine": "taint",
+                    "message": "start",
+                    "engines": request.engines,
+                }
+            )
+            try:
+                tr = run_taint(request.code)
+                if tr.findings:
+                    taint_payload = {
+                        "findings": [
+                            {
+                                "source_var": f.source_var,
+                                "sink_func": f.sink_func,
+                                "source_line": f.source_line,
+                                "sink_line": f.sink_line,
+                            }
+                            for f in tr.findings
+                        ]
+                    }
+            finally:
+                await websocket.send_json(
+                    {
+                        "type": "status",
+                        "engine": "taint",
+                        "message": "completed",
+                        "engines": request.engines,
+                    }
+                )
 
         await websocket.send_json(
             {
@@ -199,8 +278,8 @@ async def analyze_ws(websocket: WebSocket) -> None:
                 "report": {
                     "meta": {
                         "engines": request.engines,
-                        "timed_out": result.timed_out,
-                        "duration_ms": result.duration_ms,
+                        "timed_out": overall_timed_out,
+                        "duration_ms": total_duration_ms,
                     },
                     "security": security,
                     "complexity": complexity,
